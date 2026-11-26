@@ -3029,7 +3029,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_list_waiting_for_another_queues_write_reads_what_it_wrote() {
-        waiting_lists(false);
+        waiting_lists(false, false);
     }
 
     /// The same with the lists' calls translated by workers
@@ -3038,11 +3038,22 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn deferred_lists_waiting_for_another_queues_write_read_what_it_wrote() {
-        waiting_lists(true);
+        waiting_lists(true, false);
     }
 
     #[cfg(windows)]
-    fn waiting_lists(deferred: bool) {
+    #[test]
+    #[ignore = "requires a D3D12 device; run separately for each VICTORY_DEFER_LISTS value"]
+    fn overlapping_copies_across_worker_batches_survive_a_queue_wait() {
+        assert!(
+            crate::host::host().is_some(),
+            "this readback needs a D3D12 device"
+        );
+        waiting_lists(false, true);
+    }
+
+    #[cfg(windows)]
+    fn waiting_lists(deferred: bool, multiple_batches: bool) {
         if crate::host::host().is_none() {
             return; // no host GPU here
         }
@@ -3107,7 +3118,25 @@ mod tests {
         const GREATER_EQUAL: u32 = 7;
 
         // Compute: [copy source → early][wait flag ≥ 1][image → target].
-        slot::<CopyBuffer>(computing, 0x78)(computing, early, 0, source, 0, 1024);
+        if multiple_batches {
+            // Eight full 32-call batches, followed by five writes that replace
+            // the start of the buffer. Every copy is within both 1 KiB buffers.
+            for (shift, count) in [(0u64, 128), (17, 128), (30, 5)] {
+                for block in 0..count {
+                    let source_offset = (block + shift) % 128 * 8;
+                    slot::<CopyBuffer>(computing, 0x78)(
+                        computing,
+                        early,
+                        block * 8,
+                        source,
+                        source_offset,
+                        8,
+                    );
+                }
+            }
+        } else {
+            slot::<CopyBuffer>(computing, 0x78)(computing, early, 0, source, 0, 1024);
+        }
         slot::<Wait64>(computing, 0x240 + later)(computing, flag as u64, GREATER_EQUAL, 1, 0);
         let mut into_target = Location { resource: target, kind: 1, footprint: rows };
         slot::<Copy>(computing, 0x80)(computing, &into_target, 0, 0, 0, &image_at, null.cast());
@@ -3125,7 +3154,17 @@ mod tests {
         let (copied, _) = buffer_bytes(early).unwrap();
         // SAFETY: the buffers hold 1024 bytes; nothing runs meanwhile.
         let read = |at: *mut u8| unsafe { std::slice::from_raw_parts(at, 1024) }.to_vec();
-        assert_eq!(read(copied), bytes, "the part before the wait ran");
+        if multiple_batches {
+            let copied = read(copied);
+            let (blocks, _) = copied.as_chunks::<8>();
+            for (block, actual) in blocks.iter().enumerate() {
+                let last_shift = if block < 5 { 30 } else { 17 };
+                let start = (block + last_shift) % 128 * 8;
+                assert_eq!(actual, &bytes[start..start + 8], "pre-wait block {block}");
+            }
+        } else {
+            assert_eq!(read(copied), bytes, "the part before the wait ran");
+        }
         assert!(read(out).iter().all(|&b| b == 0xEE), "the part after it waits");
         // SAFETY: the buffer holds 256 bytes.
         assert_eq!(unsafe { flag.read_volatile() }, 0);
