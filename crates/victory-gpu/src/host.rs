@@ -1158,6 +1158,9 @@ impl Host {
         // and the ranges shaders write are per host copy, not per submission.
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let started = std::time::Instant::now();
+        // List workers wait out the preparation: they take the same heap and
+        // view locks (`crate::list::later`).
+        let paused = crate::list::pause_deferred();
         #[cfg(feature = "diagnostics")]
         let faults = crate::copystat::page_faults();
         #[cfg(feature = "diagnostics")]
@@ -1250,6 +1253,7 @@ impl Host {
         }
         batch.flush();
         let prepared = std::time::Instant::now();
+        drop(paused);
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::FaultsPrep, crate::copystat::page_faults().saturating_sub(faults));
         // Diagnostics: each list on its own, timed (`VICTORY_GPU_TIMING`).
@@ -3081,11 +3085,13 @@ impl Meter {
                  {indirect:.0} indirect; {root_views:.0} root-view slots/frame",
                 making = crate::pipeline::making()
             );
-            if let Some((calls, waited)) = crate::list::take_deferred() {
+            if let Some((calls, waited, paused)) = crate::list::take_deferred() {
                 tracing::info!(
-                    "list calls translated by workers: {:.0}/frame; title threads waited {:.2} ms/frame for them",
+                    "list calls translated by workers: {:.0}/frame; title threads waited {:.2} ms/frame for them; \
+                     submissions waited {:.2} ms/frame for them to pause",
                     calls as f64 / report_frames,
-                    waited / report_frames
+                    waited / report_frames,
+                    paused / report_frames
                 );
             }
             let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();

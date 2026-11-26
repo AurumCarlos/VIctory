@@ -26,7 +26,7 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockWriteGuard};
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D12::D3D12_VIEWPORT;
@@ -161,6 +161,7 @@ fn work() {
                     }
                 }
             };
+            let _batch = pause_on().then(|| PREPARING.read().unwrap_or_else(|e| e.into_inner()));
             for call in batch {
                 run(call);
             }
@@ -175,15 +176,51 @@ fn run(call: Call) {
     CALLS.fetch_add(1, Relaxed);
 }
 
-/// Calls run by workers, and time title threads spent waiting for them
+/// Calls run by workers, time title threads spent waiting for them, and
+/// time submissions waited for the workers' running batches to pause
 /// (nanoseconds), since the last report.
 static CALLS: AtomicU64 = AtomicU64::new(0);
 static WAITED_NS: AtomicU64 = AtomicU64::new(0);
+static PAUSED_NS: AtomicU64 = AtomicU64::new(0);
 
-/// Deferred calls and milliseconds waited for them since the last call
-/// (the frame report); `None` with deferral off.
-pub(crate) fn take_stats() -> Option<(u64, f64)> {
-    (workers() > 0).then(|| (CALLS.swap(0, Relaxed), WAITED_NS.swap(0, Relaxed) as f64 / 1e6))
+/// Read by a worker for each batch it runs, written while a submission is
+/// prepared (`Host::execute`): the workers' translation takes the heap and
+/// view locks the preparation takes (`descriptor::sync_heaps` holds the
+/// heaps' lock throughout and the views' for each slot), and contending for
+/// them tripled the preparing time in game (RTX 4090, 130 to 392 ms a
+/// frame, #3184). Workers wait out the preparation instead.
+static PREPARING: RwLock<()> = RwLock::new(());
+
+/// Whether workers pause while a submission is prepared
+/// (`VICTORY_DEFER_PAUSE=0` turns it off, to compare).
+fn pause_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DEFER_PAUSE").map_or(true, |v| v.trim() != "0"))
+}
+
+/// Holds the workers between batches while a submission is prepared;
+/// `None` with deferral or the pause off. Nothing may wait for a list's
+/// logged calls (`drain`) while it is held.
+pub(crate) fn pause() -> Option<RwLockWriteGuard<'static, ()>> {
+    (workers() > 0 && pause_on()).then(|| {
+        let start = std::time::Instant::now();
+        let held = PREPARING.write().unwrap_or_else(|e| e.into_inner());
+        PAUSED_NS.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
+        held
+    })
+}
+
+/// Deferred calls, milliseconds title threads waited for them, and
+/// milliseconds submissions waited for the workers to pause, since the last
+/// call (the frame report); `None` with deferral off.
+pub(crate) fn take_stats() -> Option<(u64, f64, f64)> {
+    (workers() > 0).then(|| {
+        (
+            CALLS.swap(0, Relaxed),
+            WAITED_NS.swap(0, Relaxed) as f64 / 1e6,
+            PAUSED_NS.swap(0, Relaxed) as f64 / 1e6,
+        )
+    })
 }
 
 /// A list's log, if its calls are deferred.

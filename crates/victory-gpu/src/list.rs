@@ -21,7 +21,7 @@ use crate::resource::PAGEABLE_IIDS;
 #[cfg(windows)]
 pub(crate) mod later;
 #[cfg(windows)]
-pub(crate) use later::{drain, take_stats as take_deferred};
+pub(crate) use later::{drain, pause as pause_deferred, take_stats as take_deferred};
 
 const ALLOCATOR_IIDS: [Iid; 4] = [
     guid(
