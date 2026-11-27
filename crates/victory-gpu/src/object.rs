@@ -84,6 +84,16 @@ pub(crate) extern "system" fn release(this: This) -> u32 {
     refs.load(Ordering::Relaxed)
 }
 
+/// Releases a reference to any of our objects through its own table, as
+/// the title would (the last reference frees it as its kind does).
+pub(crate) fn release_any(this: This) -> u32 {
+    // SAFETY: `this` is one of our objects; slot 2 of every table is
+    // `Release`.
+    let f: extern "system" fn(This) -> u32 =
+        unsafe { std::mem::transmute(*(*this).functions.add(2)) };
+    f(this)
+}
+
 /// Answers an interface query (or any call handing out an object): a new
 /// reference to `found`, or null and `E_NOINTERFACE`.
 pub(crate) fn answer(kind: usize, iid: *const Iid, found: Option<This>, out: *mut This) -> HRESULT {

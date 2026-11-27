@@ -12,7 +12,7 @@
 //! What stays on the title's thread:
 //! - methods that return something the title reads: the list type, its
 //!   interfaces, upload memory (`allocate_upload`) and driver hints;
-//! - `Reset`, `ResetX` and the last `Release`, which first wait until the
+//! - `Reset`, `ResetX` and `Release`, which first wait until the
 //!   list's logged calls have run, since they free what those calls read
 //!   (upload memory, the draw state, the host lists);
 //! - a submission (`crate::queue`) and a host library recording into the
@@ -233,8 +233,8 @@ fn log_of<'a>(this: This) -> Option<&'a Arc<Log>> {
 }
 
 /// Runs `f` now, or logs it for a worker if the list defers its calls.
-/// `f` owns what it reads: the title's objects as pointers (D3D12 has them
-/// live until the list has run), the rest copied.
+/// `f` owns what it reads: the title's objects as pointers, each with a
+/// reference ([`Held`]) until it has run, the rest copied.
 fn later(this: This, f: impl FnOnce() + 'static) {
     let Some(log) = log_of(this) else {
         return f();
@@ -283,14 +283,68 @@ fn settle(log: &Arc<Log>) {
     WAITED_NS.fetch_add(start.elapsed().as_nanos() as u64, Relaxed);
 }
 
-/// `count` items at `items` copied, or `None` for a null pointer.
+/// `count` items at `items` copied, or `None` for a null pointer. With no
+/// items the pointer is not read (titles pass any pointer then).
 fn copied<T: Copy>(items: *const T, count: u32) -> Option<Vec<T>> {
     if items.is_null() {
         return None;
     }
+    if count == 0 {
+        return Some(Vec::new());
+    }
     // SAFETY: the title passes `count` items.
     Some(unsafe { std::slice::from_raw_parts(items, count as usize) }.to_vec())
 }
+
+/// A reference to a title object a logged call names, released once the
+/// call has run: the title may release its objects before it submits the
+/// list, and the call reads them only when a worker runs it.
+struct Held(This);
+
+// SAFETY: our objects' counts are atomic, and titles release them from any
+// thread.
+unsafe impl Send for Held {}
+
+impl Held {
+    fn new(object: This) -> Self {
+        if !object.is_null() {
+            crate::object::add_ref(object);
+        }
+        Held(object)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            crate::object::release_any(self.0);
+        }
+    }
+}
+
+/// What a logged argument holds until its call has run: a title object a
+/// reference ([`Held`]), a value nothing.
+trait Keep {
+    fn keep(self) -> Option<Held>;
+}
+
+impl Keep for This {
+    fn keep(self) -> Option<Held> {
+        Some(Held::new(self))
+    }
+}
+
+macro_rules! values {
+    ($($ty:ty)*) => {$(
+        impl Keep for $ty {
+            fn keep(self) -> Option<Held> {
+                None
+            }
+        }
+    )*};
+}
+
+values!(u32 u64 i32 f32);
 
 /// The item at `item` copied, or `None` for a null pointer.
 fn one<T: Copy>(item: *const T) -> Option<T> {
@@ -308,11 +362,16 @@ fn at_one<T>(item: &Option<T>) -> *const T {
     item.as_ref().map_or(std::ptr::null(), std::ptr::from_ref)
 }
 
-/// Methods whose arguments are all values: logged as they are.
+/// Methods whose arguments are all values or title objects: logged as they
+/// are, the objects held until the call has run.
 macro_rules! deferred {
     ($($name:ident => $($target:ident)::+ ($($arg:ident: $ty:ty),*);)*) => {$(
         extern "system" fn $name(this: This, $($arg: $ty),*) {
-            later(this, move || $($target)::+(this, $($arg),*));
+            let held = [$(Keep::keep($arg)),*];
+            later(this, move || {
+                $($target)::+(this, $($arg),*);
+                drop(held);
+            });
         }
     )*};
 }
@@ -364,18 +423,29 @@ extern "system" fn reset_x(this: This, allocator: This, pipeline: This, flags: u
     super::reset_x(this, allocator, pipeline, flags)
 }
 
+/// Waits for the logged calls on every release, not only the one that reads
+/// a count of 1: two threads releasing at once could both read 2, and the
+/// last would free the list under a worker.
 extern "system" fn release(this: This) -> u32 {
-    if !this.is_null() && crate::object::refs(this) == 1 {
-        drain(this);
-    }
+    drain(this);
     super::list_release(this)
 }
 
 /// Returns the console's barrier "actions" (none), as the method does.
 extern "system" fn barrier(this: This, count: u32, barriers: *const Barrier) -> u32 {
     let barriers = copied(barriers, count);
+    // Transition and UAV barriers name a resource, aliasing ones two.
+    let held: Vec<Held> = barriers
+        .iter()
+        .flatten()
+        .filter(|b| b.kind <= 2)
+        .flat_map(|b| [b.first, if b.kind == 1 { b.second as This } else { std::ptr::null() }])
+        .filter(|r| !r.is_null())
+        .map(Held::new)
+        .collect();
     later(this, move || {
         super::barrier(this, count, at(&barriers));
+        drop(held);
     });
     0
 }
@@ -397,8 +467,10 @@ extern "system" fn copy_texture_region(
     source_box: *const [u32; 6],
 ) {
     let (dst, src, source_box) = (one(dst), one(src), one(source_box));
+    let held = [&dst, &src].map(|l| l.as_ref().map(|l| Held::new(l.resource)));
     later(this, move || {
         super::copy_texture_region(this, at_one(&dst), x, y, z, at_one(&src), at_one(&source_box));
+        drop(held);
     });
 }
 
@@ -451,7 +523,11 @@ extern "system" fn blend_factor(this: This, factor: *const [f32; 4]) {
 
 extern "system" fn heaps(this: This, count: u32, heaps: *const This) {
     let heaps = copied(heaps, count);
-    later(this, move || super::state::heaps(this, count, at(&heaps)));
+    let held: Vec<Held> = heaps.iter().flatten().map(|&h| Held::new(h)).collect();
+    later(this, move || {
+        super::state::heaps(this, count, at(&heaps));
+        drop(held);
+    });
 }
 
 extern "system" fn clear_unordered_uint(
@@ -464,8 +540,10 @@ extern "system" fn clear_unordered_uint(
     rects: *const RECT,
 ) {
     let (values, rects) = (one(values), copied(rects, count));
+    let held = Held::new(resource);
     later(this, move || {
         super::state::clear_unordered_uint(this, gpu, cpu, resource, at_one(&values), count, at(&rects));
+        drop(held);
     });
 }
 
@@ -479,8 +557,10 @@ extern "system" fn clear_unordered_float(
     rects: *const RECT,
 ) {
     let (values, rects) = (one(values), copied(rects, count));
+    let held = Held::new(resource);
     later(this, move || {
         super::state::clear_unordered_float(this, gpu, cpu, resource, at_one(&values), count, at(&rects));
+        drop(held);
     });
 }
 
@@ -574,7 +654,8 @@ pub(super) const NEWER_METHODS: [(usize, *const ()); 1] = [(146, barrier_groups 
 pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{BATCH, Log, push, settle};
+    use super::{BATCH, Held, Log, copied, push, settle};
+    use crate::object::{DEVICE, Object, Table, This};
 
     thread_local! {
         /// Lists made on this thread defer their calls, whatever
@@ -619,5 +700,37 @@ pub(crate) mod tests {
         for t in threads {
             t.join().unwrap();
         }
+    }
+
+    /// No items: the pointer is not read, whatever the title passes then.
+    #[test]
+    fn no_items_read_no_pointer() {
+        assert_eq!(copied(std::ptr::without_provenance::<u32>(1), 0), Some(Vec::new()));
+        assert_eq!(copied::<u32>(std::ptr::null(), 0), None);
+    }
+
+    /// A title object a logged call names outlives the title's last
+    /// release until the call has run, then goes as the title left it.
+    #[test]
+    fn logged_calls_hold_the_objects_they_name() {
+        static TABLE: Table<7> = Table(crate::object::d3d12_object(crate::object::missing_table::<DEVICE, 7>()));
+        static OBJECT: Object = Object::new(&TABLE);
+        let object: This = &OBJECT;
+        crate::object::add_ref(object);
+        let log = Arc::new(Log::default());
+        let seen = Arc::new(Mutex::new(None));
+        let (held, s, at) = (Held::new(object), seen.clone(), object as usize);
+        push(
+            &log,
+            Box::new(move || {
+                *s.lock().unwrap() = Some(crate::object::refs(at as This));
+                drop(held);
+            }),
+        );
+        crate::object::release_any(object);
+        assert_eq!(crate::object::refs(object), 1, "the call's reference");
+        settle(&log);
+        assert_eq!(*seen.lock().unwrap(), Some(1));
+        assert_eq!(crate::object::refs(object), 0);
     }
 }
